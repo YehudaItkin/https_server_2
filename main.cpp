@@ -51,12 +51,12 @@ sock_fd_write(int sock, void *buf, ssize_t buflen, int fd)
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
 
-        // printf ("passing fd %d\n", fd);
+        //printf ("passing fd %d\n", fd);
         *((int *) CMSG_DATA(cmsg)) = fd;
     } else {
         msg.msg_control = NULL;
         msg.msg_controllen = 0;
-        // printf ("not passing fd\n");
+        //printf ("not passing fd\n");
     }
 
     size = sendmsg(sock, &msg, 0);
@@ -108,7 +108,7 @@ sock_fd_read(int sock, void *buf, ssize_t bufsize, int *fd)
             }
 
             *fd = *((int *) CMSG_DATA(cmsg));
-            //printf ("received fd %d\n", *fd);
+            // printf ("received fd %d\n", *fd);
         } else
             *fd = -1;
     } else {
@@ -144,33 +144,32 @@ void worker(int sock) {
     in_settings.on_body = 0;
     in_settings.on_message_complete = 0;
 
-    http_parser in_parser;
-    http_parser_init(&in_parser, HTTP_REQUEST);
-
-    char *in_parser_buffer = new char[255];
 
     sleep(1);
-    char buf[16];
+
 
     while (1) {
-        int size = sock_fd_read(sock, buf, 16, &fd);
+        char int_buf[16]= {0};
+        int size = sock_fd_read(sock, int_buf, 16, &fd);
+
+        http_parser in_parser;
+        http_parser_init(&in_parser, HTTP_REQUEST);
 
         if (size <= 0)
             break;
 
         recved = read(fd, buffer, DEFAULT_BUFFER_SIZE);
-        if (recved < 0) {
-            // cout << "read failed" << endl;
-        }
+
+        char *in_parser_buffer = new char[255];
 
         memset(in_parser_buffer, 0, 255);
         in_parser.data = in_parser_buffer;
         size_t nparsed = http_parser_execute(&in_parser, &in_settings, buffer, recved);
 
         if (nparsed != (size_t) recved) {
-            // cout << "FAIL!!!" << endl;
+            cout << "FAIL!!!" << endl;
             close(fd);
-            continue;
+            return;
         }
 
         //form the result
@@ -188,7 +187,7 @@ void worker(int sock) {
         in_parser_buffer[i] = 0;
 
         f = fopen(in_parser_buffer, "r");
-
+        free(in_parser_buffer);
         if (f == NULL) {
 
             response << "HTTP/1.1 404 ERROR\r\n"
@@ -213,7 +212,6 @@ void worker(int sock) {
             close(fd);
         }
     }
-    free(in_parser_buffer);
 }
 
 
