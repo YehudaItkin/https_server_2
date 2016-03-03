@@ -25,12 +25,12 @@ using namespace std;
 ssize_t
 sock_fd_write(int sock, void *buf, ssize_t buflen, int fd)
 {
-    ssize_t     size;
-    struct msghdr   msg;
-    struct iovec    iov;
+    ssize_t  size;
+    struct msghdr msg;
+    struct iovec iov;
     union {
         struct cmsghdr  cmsghdr;
-        char        control[CMSG_SPACE(sizeof (int))];
+        char control[CMSG_SPACE(sizeof (int))];
     } cmsgu;
     struct cmsghdr  *cmsg;
 
@@ -51,12 +51,12 @@ sock_fd_write(int sock, void *buf, ssize_t buflen, int fd)
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
 
-        printf ("passing fd %d\n", fd);
+        // printf ("passing fd %d\n", fd);
         *((int *) CMSG_DATA(cmsg)) = fd;
     } else {
         msg.msg_control = NULL;
         msg.msg_controllen = 0;
-        printf ("not passing fd\n");
+        // printf ("not passing fd\n");
     }
 
     size = sendmsg(sock, &msg, 0);
@@ -108,7 +108,7 @@ sock_fd_read(int sock, void *buf, ssize_t bufsize, int *fd)
             }
 
             *fd = *((int *) CMSG_DATA(cmsg));
-            printf ("received fd %d\n", *fd);
+            //printf ("received fd %d\n", *fd);
         } else
             *fd = -1;
     } else {
@@ -150,20 +150,27 @@ void worker(int sock) {
     char *in_parser_buffer = new char[255];
 
     sleep(1);
+    char buf[16];
 
     while (1) {
-        recved = sock_fd_read(sock, buffer, DEFAULT_BUFFER_SIZE, &fd);
+        int size = sock_fd_read(sock, buf, 16, &fd);
 
-        if (recved <= 0)
+        if (size <= 0)
             break;
 
+        recved = read(fd, buffer, DEFAULT_BUFFER_SIZE);
+        if (recved < 0) {
+            // cout << "read failed" << endl;
+        }
 
         memset(in_parser_buffer, 0, 255);
         in_parser.data = in_parser_buffer;
         size_t nparsed = http_parser_execute(&in_parser, &in_settings, buffer, recved);
 
         if (nparsed != (size_t) recved) {
-            cout << "FAIL!!!" << endl;
+            // cout << "FAIL!!!" << endl;
+            close(fd);
+            continue;
         }
 
         //form the result
@@ -198,6 +205,7 @@ void worker(int sock) {
                     "Content-Length: " << strlen(buf) << "\r\n\r\n" << string(buf);
         }
         if (fd != -1) {
+            // cout << response.str() << endl;
             int n = write(fd, response.str().c_str(), response.str().length());
 
             if (n < 0)
@@ -222,7 +230,7 @@ void master(int sock, int sock_fd) {
             exit(1);
         }
         const char *buf = "0";
-        sock_fd_write(sock, (void*) buf, sizeof(buf), 1);
+        sock_fd_write(sock, (void*) buf, 1, newsock_fd);
     }
 
 }
