@@ -21,22 +21,104 @@
 
 using namespace std;
 
-int on_message_begin(http_parser* _) {
-    (void)_;
-    printf("\n***MESSAGE BEGIN***\n\n");
-    return 0;
+
+ssize_t
+sock_fd_write(int sock, void *buf, ssize_t buflen, int fd)
+{
+    ssize_t     size;
+    struct msghdr   msg;
+    struct iovec    iov;
+    union {
+        struct cmsghdr  cmsghdr;
+        char        control[CMSG_SPACE(sizeof (int))];
+    } cmsgu;
+    struct cmsghdr  *cmsg;
+
+    iov.iov_base = buf;
+    iov.iov_len = buflen;
+
+    msg.msg_name = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    if (fd != -1) {
+        msg.msg_control = cmsgu.control;
+        msg.msg_controllen = sizeof(cmsgu.control);
+
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_len = CMSG_LEN(sizeof (int));
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+
+        printf ("passing fd %d\n", fd);
+        *((int *) CMSG_DATA(cmsg)) = fd;
+    } else {
+        msg.msg_control = NULL;
+        msg.msg_controllen = 0;
+        printf ("not passing fd\n");
+    }
+
+    size = sendmsg(sock, &msg, 0);
+
+    if (size < 0)
+        perror ("sendmsg");
+    return size;
 }
 
-int on_headers_complete(http_parser* _) {
-    (void)_;
-    printf("\n***HEADERS COMPLETE***\n\n");
-    return 0;
-}
+ssize_t
+sock_fd_read(int sock, void *buf, ssize_t bufsize, int *fd)
+{
+    ssize_t     size;
 
-int on_message_complete(http_parser* _) {
-    (void)_;
-    printf("\n***MESSAGE COMPLETE***\n\n");
-    return 0;
+    if (fd) {
+        struct msghdr   msg;
+        struct iovec    iov;
+        union {
+            struct cmsghdr  cmsghdr;
+            char control[CMSG_SPACE(sizeof (int))];
+        } cmsgu;
+        struct cmsghdr  *cmsg;
+
+        iov.iov_base = buf;
+        iov.iov_len = bufsize;
+
+        msg.msg_name = NULL;
+        msg.msg_namelen = 0;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgu.control;
+        msg.msg_controllen = sizeof(cmsgu.control);
+        size = recvmsg (sock, &msg, 0);
+        if (size < 0) {
+            perror ("recvmsg");
+            exit(1);
+        }
+        cmsg = CMSG_FIRSTHDR(&msg);
+        if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
+            if (cmsg->cmsg_level != SOL_SOCKET) {
+                fprintf (stderr, "invalid cmsg_level %d\n",
+                         cmsg->cmsg_level);
+                exit(1);
+            }
+            if (cmsg->cmsg_type != SCM_RIGHTS) {
+                fprintf (stderr, "invalid cmsg_type %d\n",
+                         cmsg->cmsg_type);
+                exit(1);
+            }
+
+            *fd = *((int *) CMSG_DATA(cmsg));
+            printf ("received fd %d\n", *fd);
+        } else
+            *fd = -1;
+    } else {
+        size = read (sock, buf, bufsize);
+        if (size < 0) {
+            perror("read");
+            exit(1);
+        }
+    }
+    return size;
 }
 
 int on_url(http_parser* parser, const char* at, size_t length) {
@@ -44,42 +126,14 @@ int on_url(http_parser* parser, const char* at, size_t length) {
     return 0;
 }
 
-int on_header_field(http_parser* _, const char* at, size_t length) {
-    (void)_;
-    printf("Header field: %.*s\n", (int)length, at);
-    return 0;
-}
 
-int on_header_value(http_parser* _, const char* at, size_t length) {
-    (void)_;
-    printf("Header value: %.*s\n", (int)length, at);
-    return 0;
-}
-
-int on_body(http_parser* _, const char* at, size_t length) {
-    (void)_;
-    printf("Body: %.*s\n", (int)length, at);
-    return 0;
-}
-
-int on_status(http_parser* _, const char* at, size_t length) {
-    (void)_;
-    printf("status: %.*s\n", (int)length, at);
-    return 0;
-}
-
-
-void doprocessing (int sock) {
+void worker(int sock) {
     ssize_t recved;
+    int fd;
     char buffer[DEFAULT_BUFFER_SIZE];
     bzero(buffer, DEFAULT_BUFFER_SIZE);
-    recved = read(sock, buffer, DEFAULT_BUFFER_SIZE);
 
-    if (recved < 0) {
-        perror("ERROR reading from socket");
-        exit(1);
-    }
-
+    //parser setting
     http_parser_settings in_settings;
     memset(&in_settings, 0, sizeof(in_settings));
     in_settings.on_message_begin = 0;
@@ -89,68 +143,98 @@ void doprocessing (int sock) {
     in_settings.on_headers_complete = 0;
     in_settings.on_body = 0;
     in_settings.on_message_complete = 0;
-    
-    char* in_parser_buffer = new char[255];
-    memset(in_parser_buffer, 0, 255);
+
     http_parser in_parser;
-    in_parser.data = in_parser_buffer;
     http_parser_init(&in_parser, HTTP_REQUEST);
-    size_t nparsed = http_parser_execute(&in_parser, &in_settings, buffer, recved);
-    if (nparsed != (size_t) recved) {
-        cout << "FAIL!!!" << endl;
-    }
 
-    //form the result
-    std::stringstream response;
+    char *in_parser_buffer = new char[255];
 
-    char buf[1024] = {0};
-    FILE *f;
+    sleep(1);
 
-    int i;
-    for (i = 0; in_parser_buffer[i] != 0; i++) {
-        int c = in_parser_buffer[i];
-        if (!isalnum(c) && c != '.')
+    while (1) {
+        recved = sock_fd_read(sock, buffer, DEFAULT_BUFFER_SIZE, &fd);
+
+        if (recved <= 0)
             break;
+
+
+        memset(in_parser_buffer, 0, 255);
+        in_parser.data = in_parser_buffer;
+        size_t nparsed = http_parser_execute(&in_parser, &in_settings, buffer, recved);
+
+        if (nparsed != (size_t) recved) {
+            cout << "FAIL!!!" << endl;
+        }
+
+        //form the result
+        std::stringstream response;
+
+        char buf[1024] = {0};
+        FILE *f;
+
+        int i;
+        for (i = 0; in_parser_buffer[i] != 0; i++) {
+            int c = in_parser_buffer[i];
+            if (!isalnum(c) && c != '.')
+                break;
+        }
+        in_parser_buffer[i] = 0;
+
+        f = fopen(in_parser_buffer, "r");
+
+        if (f == NULL) {
+
+            response << "HTTP/1.1 404 ERROR\r\n"
+                    "Version: HTTP/1.1\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    "Content-Length: 0 \r\n\r\n";
+
+        } else {
+            fread(buf, 1, 1023, f);
+            fclose(f);
+
+            response << "HTTP/1.1 200 OK\r\nVersion: HTTP/1.1\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    "Content-Length: " << strlen(buf) << "\r\n\r\n" << string(buf);
+        }
+        if (fd != -1) {
+            int n = write(fd, response.str().c_str(), response.str().length());
+
+            if (n < 0)
+                perror("ERROR writing to socket\n");
+            close(fd);
+        }
     }
-    in_parser_buffer[i] = 0;
-
-    f = fopen(in_parser_buffer, "r");
-
     free(in_parser_buffer);
+}
 
-    if (f == NULL) {
 
-        response << "HTTP/1.1 404 ERROR\r\n"
-                "Version: HTTP/1.1\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: 0 \r\n\r\n";
+void master(int sock, int sock_fd) {
+    int newsock_fd;
+    struct sockaddr_in cli_addr;
+    int cli_len = sizeof(cli_addr);
 
-    } else {
-        fread(buf, 1, 1023, f);
-        fclose(f);
+    while (1) {
+        newsock_fd = accept(sock_fd, (struct sockaddr *) &cli_addr, (socklen_t *) &cli_len);
 
-        response << "HTTP/1.1 200 OK\r\nVersion: HTTP/1.1\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: "  << strlen(buf) <<  "\r\n\r\n" << string(buf);
-    }
-
-    int n = write(sock, response.str().c_str(), response.str().length());
-
-    if (n < 0) {
-        perror("ERROR writing to socket\n");
-        exit(1);
+        if (newsock_fd < 0) {
+            perror("ERROR on accept");
+            exit(1);
+        }
+        const char *buf = "0";
+        sock_fd_write(sock, (void*) buf, sizeof(buf), 1);
     }
 
 }
-
 int main(int argc, char** argv) {
     string ip;
     uint16_t port = 0;
     string dir;
     signal(SIGCHLD, SIG_IGN);
     int opt;
+    int deamonize = 1;
 
-    while ((opt = getopt(argc, argv, "h:p:d:")) != -1) {
+    while ((opt = getopt(argc, argv, "h:p:d:b:")) != -1) {
         switch (opt) {
             case 'h':
                 ip = optarg;
@@ -161,44 +245,49 @@ int main(int argc, char** argv) {
             case 'd':
                 dir = optarg;
                 break;
+            case 'b':
+                deamonize = atoi(optarg);
+                break;
             default: /* '?' */
                 fprintf(stderr, "Usage: -h <ip> -p <port> -d <directory>\n");
                 exit(EXIT_FAILURE);
+                break;
         }
     }
 
-    //starting a daemon
+    if (deamonize) {
+        //starting a daemon
+        signal(SIGCHLD, SIG_IGN);
+        int process_id = fork();
 
-    int process_id = fork();
+        if (process_id < 0) {
+            cout << "Fork failed\n" << endl;
+            exit(1);
+        }
 
-    if (process_id < 0) {
-        cout << "Fork failed\n" << endl;
-        exit(1);
+        //parent process. KILL HIM!!
+        if (process_id > 0) {
+            cout << "I am parent and I am going to die\n";
+            exit(0);
+        }
+
+        umask(0);
+        int sid = setsid();
+        if (sid < 0) {
+            // Return failure
+            exit(1);
+        }
+
+
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
     }
 
-    //parent process. KILL HIM!!
-    if (process_id > 0) {
-        cout << "I am parent and I am going to die\n";
-        exit(0);
-    }
-
-    umask(0);
-    int sid = setsid();
-    if(sid < 0) {
-        // Return failure
-        exit(1);
-    }
-
-
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-    // signal(SIGCHLD, SIG_IGN);
     chdir(dir.c_str());
-    signal(SIGCHLD, SIG_IGN);
     //now lets start the server socket
-    int sock_fd, newsock_fd, cli_len;
-    struct sockaddr_in serv_addr, cli_addr;
+    int sock_fd;
+    struct sockaddr_in serv_addr;
     int pid;
 
     /* First call to socket() function */
@@ -227,40 +316,36 @@ int main(int argc, char** argv) {
        * for the incoming connection
     */
 
-    cli_len = sizeof(cli_addr);
     listen(sock_fd, 100);
 
+    //Black descriptor magic
+    int sv[2];
 
-    while (1) {
-        newsock_fd = accept(sock_fd, (struct sockaddr *) &cli_addr, (socklen_t*) &cli_len);
+    int res = socketpair(AF_LOCAL, SOCK_STREAM, 0, sv);
+    if (res < 0) {
+        perror("Socket pairing failed!");
+        exit(1);
+    }
 
-        if (newsock_fd < 0) {
-            perror("ERROR on accept");
-            exit(1);
-        }
+    signal(SIGCHLD, SIG_IGN);
+    pid = fork();
+    if (pid < 0) {
+        cout << "Fork failed!" << endl;
+        exit(1);
+    }
 
-        /* Create child process */
-        pid = fork();
+    switch (pid) {
+        case 0:
+            close(sv[0]);
+            worker(sv[1]);
+            break;
 
-        if (pid < 0) {
-            perror("ERROR on fork");
-            exit(1);
-        }
+        default:
+            close(sv[1]);
+            master(sv[0], sock_fd);
+            break;
+    };
 
-        if (pid == 0) {
-            /* This is the client process */
-            setsid();
-            close(sock_fd);
-
-            doprocessing(newsock_fd);
-            close(newsock_fd);
-            exit(0);
-        }
-        else {
-            close(newsock_fd);
-        }
-
-    } /* end of while */
 
 
 
